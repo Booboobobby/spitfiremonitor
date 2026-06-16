@@ -1,13 +1,7 @@
 #!/usr/bin/env python3
 """
-Bul Armory Spitfire (2026) stock monitor.
-Polls the product page and fires a critical phone alert via ntfy.sh
-the moment it comes back in stock.
-
-Modes:
-  - Default: infinite loop, polls every CHECK_INTERVAL seconds (for VPS/Railway)
-  - RUN_ONCE=1: does two checks 30s apart, sends alert if both in_stock, exits
-                (for GitHub Actions cron and similar serverless schedulers)
+Bul Armory Spitfire (2026) stock monitor — Shopify JSON + Pushover Emergency.
+Bypasses silent mode and DND via Pushover priority 2.
 """
 
 import os
@@ -15,31 +9,27 @@ import sys
 import time
 import requests
 from datetime import datetime
-from bs4 import BeautifulSoup
 
 # ====================== CONFIG ======================
-PRODUCT_URL = "https://ustore.bularmory.com/products/spitfire-2026"
+PRODUCT_HANDLE = "spitfire-2026"
+PRODUCT_URL = f"https://ustore.bularmory.com/products/{PRODUCT_HANDLE}"
+JSON_URL = f"{PRODUCT_URL}.json"
 
-NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "PASTE_YOUR_TOPIC_HERE")
+PUSHOVER_TOKEN = os.environ.get("PUSHOVER_TOKEN")
+PUSHOVER_USER = os.environ.get("PUSHOVER_USER")
+
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "60"))
 RUN_ONCE = bool(os.environ.get("RUN_ONCE"))
 CONFIRM_HITS = 2
 # ====================================================
 
-OUT_OF_STOCK_MARKERS = [
-    "sold out", "out of stock", "coming soon",
-    "notify me when available", "currently unavailable",
-]
-IN_STOCK_MARKERS = [
-    "add to bag", "add to cart", "buy now", "in stock",
-]
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/121.0.0.0 Safari/537.36"
     ),
-    "Accept-Language": "en-US,en;q=0.9",
+    "Accept": "application/json",
 }
 
 
@@ -48,99 +38,76 @@ def log(msg):
 
 
 def send_critical_alert():
-    if NTFY_TOPIC.startswith("PASTE"):
-        log("NTFY_TOPIC not configured. Skipping alert.")
+    if not (PUSHOVER_TOKEN and PUSHOVER_USER):
+        log("Pushover credentials missing. Skipping alert.")
         return
     try:
         r = requests.post(
-            f"https://ntfy.sh/{NTFY_TOPIC}",
-            data="BUL ARMORY SPITFIRE (2026) IS IN STOCK. BUY NOW.".encode("utf-8"),
-            headers={
-                "Title": "SPITFIRE IN STOCK",
-                "Priority": "urgent",
-                "Tags": "rotating_light,warning,gun",
-                "Click": PRODUCT_URL,
-                "Actions": f"view, Buy Now, {PRODUCT_URL}, clear=true",
+            "https://api.pushover.net/1/messages.json",
+            data={
+                "token": PUSHOVER_TOKEN,
+                "user": PUSHOVER_USER,
+                "title": "SPITFIRE IN STOCK",
+                "message": f"Bul Armory Spitfire 2026 is in stock. Buy now: {PRODUCT_URL}",
+                "url": PRODUCT_URL,
+                "url_title": "Buy Now",
+                "priority": 2,
+                "retry": 30,
+                "expire": 3600,
+                "sound": "siren",
             },
             timeout=15,
         )
         if r.status_code == 200:
-            log("CRITICAL ALERT SENT.")
+            log("EMERGENCY ALERT SENT.")
         else:
-            log(f"ntfy error {r.status_code}: {r.text}")
+            log(f"Pushover error {r.status_code}: {r.text}")
     except Exception as e:
-        log(f"ntfy send failed: {e}")
+        log(f"Pushover send failed: {e}")
 
 
-def send_status(msg):
-    if NTFY_TOPIC.startswith("PASTE"):
-        return
+def detect_stock():
+    """Returns 'in_stock', 'out_of_stock', or 'unknown'."""
     try:
-        requests.post(
-            f"https://ntfy.sh/{NTFY_TOPIC}",
-            data=msg.encode("utf-8"),
-            headers={"Title": "Spitfire monitor", "Priority": "low"},
-            timeout=15,
-        )
-    except Exception as e:
-        log(f"status send failed: {e}")
-
-
-def fetch_page():
-    try:
-        r = requests.get(PRODUCT_URL, headers=HEADERS, timeout=25)
+        r = requests.get(JSON_URL, headers=HEADERS, timeout=25)
         r.raise_for_status()
-        return r.text
+        data = r.json()
     except Exception as e:
         log(f"Fetch error: {e}")
-        return None
+        return "unknown"
 
+    variants = data.get("product", {}).get("variants", [])
+    if not variants:
+        log("No variants in JSON response.")
+        return "unknown"
 
-def detect_stock(html):
-    text = BeautifulSoup(html, "html.parser").get_text(" ", strip=True).lower()
-    found_oos = any(m in text for m in OUT_OF_STOCK_MARKERS)
-    found_in  = any(m in text for m in IN_STOCK_MARKERS)
-    if found_in and not found_oos:
-        return "in_stock"
-    if found_oos and not found_in:
-        return "out_of_stock"
-    if found_in and found_oos:
-        return "in_stock"
-    return "unknown"
+    any_available = any(v.get("available") for v in variants)
+    log(f"Variants: {[(v.get('title'), v.get('available')) for v in variants]}")
+    return "in_stock" if any_available else "out_of_stock"
 
 
 def run_once():
-    """Two checks 30s apart. Alert only if both confirm in_stock."""
-    log(f"RUN_ONCE mode. Checking {PRODUCT_URL}")
+    log(f"RUN_ONCE mode. Checking {JSON_URL}")
     hits = 0
     for i in range(2):
         if i > 0:
             time.sleep(30)
-        html = fetch_page()
-        if not html:
-            log(f"Check {i+1}: fetch failed")
-            return
-        state = detect_stock(html)
+        state = detect_stock()
         log(f"Check {i+1}: {state}")
         if state == "in_stock":
             hits += 1
         else:
-            return  # not in stock, exit
+            return
     if hits >= 2:
         send_critical_alert()
 
 
 def run_loop():
-    log(f"Loop mode. Monitoring {PRODUCT_URL} every {CHECK_INTERVAL}s")
-    send_status(f"Monitor started. Watching Spitfire 2026 every {CHECK_INTERVAL}s.")
+    log(f"Loop mode. Monitoring {JSON_URL} every {CHECK_INTERVAL}s")
     hits = 0
     alerted = False
     while True:
-        html = fetch_page()
-        if html is None:
-            time.sleep(CHECK_INTERVAL)
-            continue
-        state = detect_stock(html)
+        state = detect_stock()
         log(f"State: {state}")
         if state == "in_stock":
             hits += 1
